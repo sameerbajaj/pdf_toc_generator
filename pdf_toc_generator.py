@@ -368,6 +368,10 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
         
         # Logic to handle the parts
         if title_part:
+            # Check if title starts with a number BEFORE stripping it
+            # This helps identify new numbered sections that should reset previous accumulated text
+            starts_with_number = bool(re.match(r'^\d', title_part.strip()))
+            
             # Clean title part (fix wide spacing like "B I G B I L L")
             # Replace "Letter Space" with "Letter" if followed by another letter
             title_part = re.sub(r'\b([A-Z])\s+(?=[A-Z]\b)', r'\1', title_part)
@@ -404,6 +408,21 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
                     gap = this_y_top - last_y_bottom
                     # If gap is large (e.g. > 20 units), assume the previous lines were orphaned headers
                     if gap > 20:
+                        current_title_lines = []
+                        current_x0 = None
+                
+                # Check if this line starts with a number (indicating a new section)
+                # while we already have accumulated text that doesn't look like a prefix.
+                if current_title_lines and starts_with_number:
+                    # Check if previous lines look like a prefix
+                    prev_text = " ".join(current_title_lines).upper()
+                    is_prefix = False
+                    for prefix in ['CHAPTER', 'PART', 'SECTION', 'UNIT', 'MODULE']:
+                        if prev_text.endswith(prefix) or prev_text == prefix:
+                            is_prefix = True
+                            break
+                    
+                    if not is_prefix:
                         current_title_lines = []
                         current_x0 = None
                 
