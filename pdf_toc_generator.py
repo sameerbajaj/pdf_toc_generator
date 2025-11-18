@@ -57,8 +57,13 @@ def detect_toc_page(pdf_path, max_pages_to_check=10):
     return None
 
 
-def extract_toc_from_page(pdf_path, toc_page_nums):
+def extract_toc_from_page(pdf_path, toc_page_nums, use_ocr_mode=False):
     """Extract TOC entries from dedicated TOC page(s)."""
+    # If OCR mode is enabled, use OCR-style extraction directly
+    if use_ocr_mode:
+        return extract_toc_ocr_style(pdf_path, toc_page_nums)
+    
+    # Otherwise, try standard extraction first
     doc = fitz.open(pdf_path)
     
     if isinstance(toc_page_nums, int):
@@ -67,6 +72,7 @@ def extract_toc_from_page(pdf_path, toc_page_nums):
     toc_entries = []
     pending_header = None
     
+    # Try standard extraction first
     for toc_page_num in toc_page_nums:
         page = doc[toc_page_num]
         blocks = page.get_text("dict", flags=11)["blocks"]
@@ -129,6 +135,105 @@ def extract_toc_from_page(pdf_path, toc_page_nums):
     
     if toc_entries:
         print(f"✓ Extracted {len(toc_entries)} entries from TOC page")
+        return toc_entries
+    
+    return toc_entries
+
+
+def extract_toc_ocr_style(pdf_path, toc_page_nums):
+    """
+    Extract TOC from OCR'd PDFs where titles and page numbers are on separate lines.
+    This handles cases where the TOC has all titles first, then all page numbers.
+    """
+    doc = fitz.open(pdf_path)
+    
+    all_lines = []
+    
+    # Collect all text lines from TOC pages
+    for toc_page_num in toc_page_nums:
+        page = doc[toc_page_num]
+        text = page.get_text()
+        lines = [l.strip() for l in text.split('\n') if l.strip()]
+        all_lines.extend(lines)
+    
+    doc.close()
+    
+    # Skip the "TABLE OF CONTENTS" header
+    all_lines = [l for l in all_lines if not re.match(r'^(table\s+of\s+)?contents$', l, re.IGNORECASE)]
+    
+    # Separate potential titles from page numbers
+    titles = []
+    page_numbers = []
+    i = 0
+    
+    while i < len(all_lines):
+        line = all_lines[i]
+        
+        # Check if line is just a number (page number)
+        if re.match(r'^\d+$', line):
+            page_numbers.append(int(line))
+            i += 1
+        # Check if line is a separator or garbled text - skip it
+        elif re.match(r'^[—_\-\s]+$|^[a-z]{1,3}\s+[A-Z][a-z]\s+', line):
+            i += 1
+        # Check for section headers (short all-caps lines that should be combined)
+        elif line.isupper() and len(line.split()) <= 3 and i + 1 < len(all_lines):
+            # Look ahead to see if next lines are also short all-caps (part of same header)
+            combined = [line]
+            j = i + 1
+            while j < len(all_lines) and all_lines[j].isupper() and len(all_lines[j].split()) <= 3:
+                # Stop if we hit a number or separator
+                if re.match(r'^\d+$|^[—_\-\s]+$', all_lines[j]):
+                    break
+                combined.append(all_lines[j])
+                j += 1
+            
+            # Only combine if we found multiple short all-caps lines
+            if len(combined) > 1:
+                titles.append(' '.join(combined))
+                i = j
+            else:
+                titles.append(line)
+                i += 1
+        # Otherwise treat as title
+        elif len(line) > 1 and not line.isdigit():
+            titles.append(line)
+            i += 1
+        else:
+            i += 1
+    
+    # Try to match titles to page numbers
+    toc_entries = []
+    
+    if len(titles) > 0 and len(page_numbers) > 0:
+        # Match titles to page numbers 1-to-1
+        num_matches = min(len(titles), len(page_numbers))
+        
+        print(f"  Found {len(titles)} potential titles and {len(page_numbers)} page numbers")
+        
+        # Quick validation: check if page numbers are reasonable
+        doc = fitz.open(pdf_path)
+        page_count = doc.page_count
+        doc.close()
+        
+        out_of_range_count = sum(1 for p in page_numbers[:num_matches] if p > page_count)
+        
+        if out_of_range_count > num_matches * 0.5:
+            print(f"  ⚠ Warning: {out_of_range_count}/{num_matches} page numbers exceed PDF page count ({page_count})")
+            print(f"  This appears to be an excerpt or the TOC references the original document's page numbers.")
+            print(f"  Will use fuzzy matching to find headings in the available pages.")
+        
+        if num_matches > 0:
+            for i in range(num_matches):
+                toc_entries.append({
+                    "title": titles[i],
+                    "page": page_numbers[i],
+                    "indent": 0,  # Can't determine from OCR
+                    "font_size": 12.0,  # Default
+                    "original_text": titles[i]
+                })
+            
+            print(f"✓ Matched {len(toc_entries)} entries using OCR-style extraction")
     
     return toc_entries
 
@@ -154,20 +259,34 @@ def assign_toc_hierarchy(toc_entries):
     return toc_entries
 
 
-def find_heading_in_document(pdf_path, heading_title, expected_page, search_window=5):
+def find_heading_in_document(pdf_path, heading_title, expected_page, search_window=5, exclude_pages=None):
     """Find where a heading actually appears in the document."""
     doc = fitz.open(pdf_path)
+    page_count = len(doc)
+    
+    # Convert exclude_pages to 0-indexed set
+    exclude_page_nums = set()
+    if exclude_pages:
+        exclude_page_nums = {p - 1 if p > 0 else p for p in exclude_pages}
     
     normalized_title = re.sub(r'\s+', ' ', heading_title.lower().strip())
     normalized_title = re.sub(r'[^\w\s]', '', normalized_title)
     
-    start_page = max(0, expected_page - search_window)
-    end_page = min(len(doc), expected_page + search_window)
+    # If expected page is out of range, search the entire document
+    if expected_page < 1 or expected_page > page_count:
+        start_page = 0
+        end_page = page_count
+    else:
+        start_page = max(0, expected_page - search_window)
+        end_page = min(page_count, expected_page + search_window)
     
-    best_match_page = expected_page
+    best_match_page = min(expected_page, page_count)
     best_match_score = 0
     
     for page_num in range(start_page, end_page):
+        # Skip TOC pages
+        if page_num in exclude_page_nums:
+            continue
         page = doc[page_num]
         text = page.get_text().lower()
         
@@ -176,11 +295,23 @@ def find_heading_in_document(pdf_path, heading_title, expected_page, search_wind
         
         if normalized_title in normalized_text:
             doc.close()
-            return page_num + 1
+            return page_num + 1, 1.0  # Perfect match
         
         title_words = set(normalized_title.split())
         text_words = set(normalized_text.split())
-        match_score = len(title_words & text_words) / len(title_words) if title_words else 0
+        
+        if not title_words:
+            continue
+            
+        # Calculate match score
+        matching_words = title_words & text_words
+        match_score = len(matching_words) / len(title_words)
+        
+        # For better matching, require at least 3 matching words OR 80% match for short titles
+        # This prevents matching common words like "INTRODUCTION TO PART ONE" when only scattered words match
+        min_words_matched = min(3, len(title_words))
+        if len(matching_words) < min_words_matched and match_score < 0.8:
+            match_score = match_score * 0.7  # Penalize matches with few words
         
         if match_score > best_match_score:
             best_match_score = match_score
@@ -188,30 +319,48 @@ def find_heading_in_document(pdf_path, heading_title, expected_page, search_wind
     
     doc.close()
     
-    if best_match_score > 0.7:
-        return best_match_page
+    # Use a lower threshold if we had to search the entire document
+    threshold = 0.5 if (expected_page < 1 or expected_page > page_count) else 0.7
     
-    return expected_page
+    if best_match_score > threshold:
+        return best_match_page, best_match_score
+    
+    return min(expected_page, page_count), best_match_score
 
 
-def match_toc_to_document(pdf_path, toc_entries):
+def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False):
     """Match TOC entries to actual locations in the document."""
     matched_entries = []
+    skipped_entries = []
+    
+    # Convert toc_pages to 1-indexed list for exclude_pages
+    exclude_pages = [p + 1 for p in toc_pages] if toc_pages else None
     
     print(f"\nMatching {len(toc_entries)} TOC entries to document...")
     
     for i, entry in enumerate(toc_entries):
-        actual_page = find_heading_in_document(
+        actual_page, match_score = find_heading_in_document(
             pdf_path, 
             entry["title"], 
-            entry["page"]
+            entry["page"],
+            exclude_pages=exclude_pages
         )
+        
+        # In OCR mode, only include entries with good matches (>0.85 score)
+        # This ensures we only add bookmarks for content that actually exists in the document
+        # Higher threshold prevents false matches from common word overlap
+        if ocr_mode and match_score < 0.85:
+            skipped_entries.append({"title": entry["title"], "score": match_score})
+            if (i + 1) % 10 == 0:
+                print(f"  Processed {i + 1}/{len(toc_entries)} entries...")
+            continue
         
         matched_entry = {
             "title": entry["title"],
             "page": actual_page,
             "level": entry["level"],
-            "toc_page": entry["page"]
+            "toc_page": entry["page"],
+            "match_score": match_score
         }
         
         matched_entries.append(matched_entry)
@@ -219,7 +368,13 @@ def match_toc_to_document(pdf_path, toc_entries):
         if (i + 1) % 10 == 0:
             print(f"  Processed {i + 1}/{len(toc_entries)} entries...")
     
-    print(f"✓ Matched all entries to document pages")
+    if skipped_entries:
+        print(f"⚠ Skipped {len(skipped_entries)} entries with poor matches (not found in document)")
+        if len(skipped_entries) <= 5:
+            for entry in skipped_entries:
+                print(f"  - {entry['title']} (match score: {entry['score']:.2f})")
+    
+    print(f"✓ Matched {len(matched_entries)} entries to document pages")
     
     return matched_entries
 
@@ -389,8 +544,19 @@ def normalize_toc_hierarchy(toc):
 
 
 def add_toc_to_pdf(input_pdf_path, output_pdf_path, toc):
-    """Add table of contents as bookmarks to a PDF file."""
+    """Add table of contents bookmarks to the PDF."""
     doc = fitz.open(input_pdf_path)
+    
+    # Validate page numbers
+    page_count = doc.page_count
+    for i, entry in enumerate(toc):
+        if entry[2] > page_count:
+            print(f"⚠ Warning: Entry {i} '{entry[1]}' has page {entry[2]} but PDF only has {page_count} pages. Adjusting to page {page_count}.")
+            entry[2] = page_count
+        elif entry[2] < 1:
+            print(f"⚠ Warning: Entry {i} '{entry[1]}' has invalid page {entry[2]}. Adjusting to page 1.")
+            entry[2] = 1
+    
     doc.set_toc(toc)
     doc.save(output_pdf_path, garbage=4, deflate=True)
     doc.close()
@@ -401,7 +567,7 @@ def add_toc_to_pdf(input_pdf_path, output_pdf_path, toc):
 
 def generate_pdf_toc(input_pdf_path, output_pdf_path=None, 
                      use_existing_toc=True, flat_structure=False,
-                     add_toc_bookmark=True):
+                     add_toc_bookmark=True, use_ocr_mode=False):
     """Complete workflow to generate TOC for a PDF."""
     print("=" * 80)
     print("PDF TABLE OF CONTENTS GENERATOR")
@@ -425,14 +591,16 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
         if toc_page is not None:
             toc_page_nums = toc_page if isinstance(toc_page, list) else [toc_page]
             print("Step 2: Extracting TOC from dedicated page...")
-            toc_entries = extract_toc_from_page(input_pdf_path, toc_page)
+            if use_ocr_mode:
+                print("  (OCR mode enabled - will use enhanced extraction for poor quality scans)")
+            toc_entries = extract_toc_from_page(input_pdf_path, toc_page, use_ocr_mode)
             
             if toc_entries:
                 print("Step 3: Assigning hierarchy to TOC entries...")
                 toc_entries = assign_toc_hierarchy(toc_entries)
                 
                 print("Step 4: Matching TOC entries to document pages...")
-                matched_entries = match_toc_to_document(input_pdf_path, toc_entries)
+                matched_entries = match_toc_to_document(input_pdf_path, toc_entries, toc_page_nums, use_ocr_mode)
                 
                 headings = matched_entries
                 method_used = "existing_toc"
@@ -561,6 +729,12 @@ def interactive_mode():
         valid_values=["y", "n"]
     ).lower() == "y"
     
+    use_ocr_mode = get_user_input(
+        "Is this a poorly scanned/OCR'd PDF? (y/n)", 
+        default="n", 
+        valid_values=["y", "n"]
+    ).lower() == "y"
+    
     flat_structure = get_user_input(
         "Use flat structure (no hierarchy)? (y/n)", 
         default="n", 
@@ -581,7 +755,8 @@ def interactive_mode():
         output_path,
         use_existing_toc=use_existing,
         flat_structure=flat_structure,
-        add_toc_bookmark=add_toc_bookmark
+        add_toc_bookmark=add_toc_bookmark,
+        use_ocr_mode=use_ocr_mode
     )
 
 
@@ -630,6 +805,11 @@ Examples:
         action="store_true",
         help="Don't add 'Table of Contents' bookmark"
     )
+    parser.add_argument(
+        "--ocr-mode",
+        action="store_true",
+        help="Use OCR mode for poorly scanned PDFs (enhanced extraction for separated titles/page numbers)"
+    )
     
     args = parser.parse_args()
     
@@ -654,7 +834,8 @@ Examples:
             args.output,
             use_existing_toc=not args.no_existing_toc,
             flat_structure=args.flat,
-            add_toc_bookmark=not args.no_toc_bookmark
+            add_toc_bookmark=not args.no_toc_bookmark,
+            use_ocr_mode=args.ocr_mode
         )
 
 
