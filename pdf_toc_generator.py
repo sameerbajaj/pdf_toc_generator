@@ -516,13 +516,22 @@ def generate_toc_structure(headings):
     if not headings:
         return []
     
-    first_level = headings[0]["level"]
+    # Sort headings by page number to ensure proper bookmark order
+    # Bookmarks MUST be in ascending page order in the PDF
+    sorted_headings = sorted(headings, key=lambda x: x["page"])
+    
+    first_level = sorted_headings[0]["level"]
     level_offset = 1 - first_level
     
     toc = []
     prev_level = 0
+    prev_page = 0
     
-    for heading in headings:
+    for heading in sorted_headings:
+        # Skip if page number doesn't increase (invalid bookmark order)
+        if heading["page"] <= prev_page:
+            continue
+            
         normalized_level = heading["level"] + level_offset
         normalized_level = max(1, normalized_level)
         
@@ -536,6 +545,7 @@ def generate_toc_structure(headings):
         ])
         
         prev_level = normalized_level
+        prev_page = heading["page"]
     
     return toc
 
@@ -653,16 +663,46 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
     if method_used == "existing_toc":
         toc = []
         
-        # Add TOC page itself as first bookmark if requested
-        if toc_page_nums and add_toc_bookmark:
-            toc.append([1, "Table of Contents", toc_page_nums[0] + 1])
+        # Build initial TOC, filtering out entries that would violate page order
+        # Process in TOC order, but skip entries whose page number doesn't increase
+        prev_page = 0
+        skipped_count = 0
         
         for entry in headings:
+            page = entry["page"]
+            
+            # Skip if page doesn't increase (violates bookmark ordering requirement)
+            if page <= prev_page:
+                skipped_count += 1
+                continue
+                
             toc.append([
-                entry["level"] + (1 if toc_page_nums and add_toc_bookmark else 0),
+                entry["level"],
                 entry["title"],
-                entry["page"]
+                page
             ])
+            prev_page = page
+        
+        if skipped_count > 0:
+            print(f"  ⚠ Skipped {skipped_count} entries that would violate page order")
+        
+        # Add TOC bookmark if requested, inserting it in the correct position
+        if toc_page_nums and add_toc_bookmark:
+            toc_page = toc_page_nums[0] + 1
+            # Find where to insert TOC bookmark to maintain page order
+            insert_pos = 0
+            for i, entry in enumerate(toc):
+                if entry[2] < toc_page:
+                    insert_pos = i + 1
+                else:
+                    break
+            toc.insert(insert_pos, [1, "Table of Contents", toc_page])
+            
+            # Adjust levels of entries after TOC bookmark
+            for i in range(len(toc)):
+                if i != insert_pos:  # Don't adjust the TOC bookmark itself
+                    toc[i][0] += 1
+        
         toc = normalize_toc_hierarchy(toc)
     else:
         toc = generate_toc_structure(headings)
