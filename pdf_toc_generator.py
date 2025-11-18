@@ -251,42 +251,34 @@ def assign_toc_hierarchy(toc_entries):
     if not toc_entries:
         return []
     
-    # Get unique indent values
     indents = sorted(set(entry["indent"] for entry in toc_entries))
     
-    # If we have many unique indents (e.g., from x-positions), cluster them into levels
-    if len(indents) > 5:
-        # First, filter out outlier indents used by very few entries (< 3% of total)
-        indent_counts = {}
-        for entry in toc_entries:
-            indent_counts[entry["indent"]] = indent_counts.get(entry["indent"], 0) + 1
-        
-        min_count = 2  # At least 2 entries to avoid single outliers
-        common_indents = [indent for indent in indents if indent_counts[indent] >= min_count]
-        
-        if common_indents:
-            indents = common_indents
-        
-        # Use simple clustering: group indents within 2 units of each other
+    # Check if we have x-position based indents (large values > 100)
+    # These come from OCR mode and need clustering
+    if indents and max(indents) > 100:
+        # Cluster similar x-positions within 5 units
         clustered = []
         for indent in indents:
-            # Find existing cluster within 2 units
-            found = False
-            for i, cluster_val in enumerate(clustered):
-                if abs(indent - cluster_val) < 2:
-                    found = True
+            # Find existing cluster within 5 units
+            found_cluster = None
+            for cluster in clustered:
+                if abs(indent - cluster) <= 5:
+                    found_cluster = cluster
                     break
-            if not found:
+            if found_cluster is None:
                 clustered.append(indent)
-        
         indents = sorted(clustered)
     
     font_sizes = sorted(set(entry["font_size"] for entry in toc_entries), reverse=True)
     
     for entry in toc_entries:
-        # Find the closest indent cluster
-        closest_indent = min(indents, key=lambda x: abs(x - entry["indent"]))
-        indent_score = indents.index(closest_indent)
+        # For clustered indents, find the closest cluster
+        if indents and max(indents) > 100:
+            closest_indent = min(indents, key=lambda x: abs(x - entry["indent"]))
+            indent_score = indents.index(closest_indent)
+        else:
+            indent_score = indents.index(entry["indent"])
+        
         font_score = font_sizes.index(entry["font_size"])
         entry["hierarchy_score"] = indent_score + (font_score * 0.5)
     
@@ -450,7 +442,9 @@ def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False,
             "page": actual_page,
             "level": entry["level"],
             "toc_page": entry["page"],
-            "match_score": match_score
+            "match_score": match_score,
+            "indent": entry.get("indent", 0),
+            "font_size": entry.get("font_size", 12.0)
         }
         
         entry_with_status["found"] = True
@@ -635,7 +629,9 @@ def approximate_missing_entries(all_entries, matched_entries, skipped_entries, p
                 "level": entry["level"],
                 "toc_page": entry["toc_page"],
                 "match_score": validation_score,
-                "approximated": True
+                "approximated": True,
+                "indent": entry.get("indent", 0),
+                "font_size": entry.get("font_size", 12.0)
             })
     
     return approximated
@@ -762,8 +758,10 @@ def generate_toc_structure(headings):
     # Bookmarks MUST be in ascending page order in the PDF
     sorted_headings = sorted(headings, key=lambda x: x["page"])
     
-    first_level = sorted_headings[0]["level"]
-    level_offset = 1 - first_level
+    # Compress levels to consecutive integers starting from 1
+    # This handles cases where filtering removed intermediate levels
+    unique_levels = sorted(set(h["level"] for h in sorted_headings))
+    level_map = {old: new for new, old in enumerate(unique_levels, 1)}
     
     toc = []
     prev_level = 0
@@ -774,11 +772,8 @@ def generate_toc_structure(headings):
         if heading["page"] <= prev_page:
             continue
             
-        normalized_level = heading["level"] + level_offset
+        normalized_level = level_map[heading["level"]]
         normalized_level = max(1, normalized_level)
-        
-        if normalized_level > prev_level + 1:
-            normalized_level = prev_level + 1
         
         toc.append([
             normalized_level,
@@ -907,17 +902,22 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
     print(f"Step {5 if method_used == 'existing_toc' else 4}: Generating TOC structure...")
     
     if method_used == "existing_toc":
+        # Compress levels to consecutive integers starting from 1
+        # This handles cases where filtering removed intermediate levels
+        unique_levels = sorted(set(h["level"] for h in headings))
+        level_map = {old: new for new, old in enumerate(unique_levels, 1)}
+        
         toc = []
         
         # Build initial TOC with smart handling of orphaned children
-        # When an entry has no parent, promote it to top level
+        # When an entry has no parent, promote to top level
         prev_page = 0
         skipped_count = 0
         last_level_1_idx = -1  # Track index of last level 1 entry
         
         for i, entry in enumerate(headings):
             page = entry["page"]
-            level = entry["level"]
+            level = level_map[entry["level"]]  # Apply level compression
             
             # Skip if page doesn't increase (violates bookmark ordering requirement)
             if page <= prev_page:
