@@ -213,7 +213,8 @@ def get_visual_lines(page):
         full_text = " ".join(s["text"] for s in v_line["segments"])
         final_lines.append({
             "text": full_text,
-            "x0": v_line["bbox"][0] # Keep indentation info
+            "x0": v_line["bbox"][0], # Keep indentation info
+            "segments": v_line["segments"]
         })
         
     return final_lines
@@ -237,6 +238,10 @@ def clean_ocr_page_num(text):
     if text.isdigit():
         return int(text)
         
+    # Avoid converting common words that might match the pattern
+    if text.upper() in {'SO', 'IS', 'OS', 'OO', 'LL', 'SS', 'TO', 'BY', 'OF', 'IN', 'ON', 'AT', 'AS'}:
+        return None
+
     # Apply replacements
     cleaned = ""
     for char in text:
@@ -249,6 +254,11 @@ def clean_ocr_page_num(text):
             return None
             
     if cleaned and cleaned.isdigit():
+        # Safety check: if the original text was long (e.g. "Business") and we converted it to "855",
+        # it's probably wrong. Only allow replacements for short strings or if mostly digits.
+        if len(text) > 4 and sum(c.isdigit() for c in text) == 0:
+             return None
+             
         return int(cleaned)
     return None
 
@@ -285,6 +295,7 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
     for line in all_lines:
         text = line["text"]
         x0 = line["x0"]
+        segments = line.get("segments", [])
         
         # Check for page number
         page_num = None
@@ -299,12 +310,54 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
             # We do NOT treat it as a title
         else:
             # 2. Trailing page number
-            match = re.search(r'^(.*)\s+([0-9IlOoSBZ]{1,4})$', text)
-            if match:
-                pot_num = clean_ocr_page_num(match.group(2))
-                if pot_num is not None and pot_num <= page_count + 50:
-                    page_num = pot_num
-                    title_part = match.group(1).strip()
+            # Use segments if available to check for spatial separation
+            page_num_candidate = None
+            title_candidate = None
+            
+            if segments and len(segments) > 1:
+                # Check the last segment
+                last_seg = segments[-1]
+                last_text = last_seg["text"].strip()
+                
+                # Check if last segment looks like a page number
+                pot_num = clean_ocr_page_num(last_text)
+                if pot_num is not None:
+                    # Check separation from previous segment
+                    prev_seg = segments[-2]
+                    gap = last_seg["bbox"][0] - prev_seg["bbox"][2]
+                    
+                    # If gap is significant (> 10) OR text is clearly a number
+                    if gap > 10 or last_text.isdigit():
+                        page_num_candidate = pot_num
+                        # Title is everything before
+                        title_candidate = " ".join(s["text"] for s in segments[:-1])
+            
+            if page_num_candidate is not None:
+                 if page_num_candidate <= page_count + 50:
+                    page_num = page_num_candidate
+                    title_part = title_candidate
+            else:
+                # Fallback to regex
+                match = re.search(r'^(.*)\s+([0-9IlOoSBZ]{1,4})$', text)
+                if match:
+                    pot_num = clean_ocr_page_num(match.group(2))
+                    if pot_num is not None and pot_num <= page_count + 50:
+                        # Only accept if the "number" part doesn't look like a word part
+                        # e.g. "Analysis" -> "Analys" "is" (15) - reject
+                        # "Chapter I" -> "Chapter" "I" (1) - accept
+                        
+                        suffix = match.group(2)
+                        prefix = match.group(1)
+                        
+                        is_valid_num = True
+                        if not suffix.isdigit() and len(suffix) >= 2:
+                             # If it's letters, check if it's a common word ending
+                             if suffix.lower() in {'is', 'so', 'to', 'by', 'of', 'in', 'on', 'at', 'as'}:
+                                 is_valid_num = False
+                        
+                        if is_valid_num:
+                            page_num = pot_num
+                            title_part = prefix.strip()
             
             # 3. Just title
             if page_num is None:
