@@ -10,12 +10,11 @@ dependencies = [
 authors = [
     {name = "Your Name", email = "your.email@example.com"}
 ]
-license = {text = "MIT"}
+license = "MIT"
 keywords = ["pdf", "table-of-contents", "bookmarks", "toc", "pymupdf"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -32,3 +31,6 @@ dev = [
 
 [project.scripts]
 pdf_toc_generator = "pdf_toc_generator:main"
+
+[tool.setuptools]
+py-modules = ["pdf_toc_generator"]
