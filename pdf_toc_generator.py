@@ -162,45 +162,33 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
     all_lines = [l for l in all_lines if not re.match(r'^(table\s+of\s+)?contents$', l, re.IGNORECASE)]
     
     # Separate potential titles from page numbers
+    # Keep it simple: treat each line as either a title or page number
     titles = []
     page_numbers = []
-    i = 0
     
-    while i < len(all_lines):
-        line = all_lines[i]
-        
+    for line in all_lines:
         # Check if line is just a number (page number)
         if re.match(r'^\d+$', line):
             page_numbers.append(int(line))
-            i += 1
         # Check if line is a separator or garbled text - skip it
         elif re.match(r'^[—_\-\s]+$|^[a-z]{1,3}\s+[A-Z][a-z]\s+', line):
-            i += 1
-        # Check for section headers (short all-caps lines that should be combined)
-        elif line.isupper() and len(line.split()) <= 3 and i + 1 < len(all_lines):
-            # Look ahead to see if next lines are also short all-caps (part of same header)
-            combined = [line]
-            j = i + 1
-            while j < len(all_lines) and all_lines[j].isupper() and len(all_lines[j].split()) <= 3:
-                # Stop if we hit a number or separator
-                if re.match(r'^\d+$|^[—_\-\s]+$', all_lines[j]):
-                    break
-                combined.append(all_lines[j])
-                j += 1
-            
-            # Only combine if we found multiple short all-caps lines
-            if len(combined) > 1:
-                titles.append(' '.join(combined))
-                i = j
-            else:
-                titles.append(line)
-                i += 1
+            continue
         # Otherwise treat as title
-        elif len(line) > 1 and not line.isdigit():
-            titles.append(line)
-            i += 1
-        else:
-            i += 1
+        elif not line.isdigit():
+            word_count = len(line.split())
+            # For single words: only keep if they're ALL CAPS and look like section markers
+            # Skip common words like "WRITING", "LOGIC", "PART"
+            if word_count == 1:
+                common_words = {'PART', 'LOGIC', 'WRITING', 'CHAPTER', 'SECTION'}
+                if line.isupper() and len(line) >= 7 and line not in common_words:
+                    titles.append(line)
+            # For multi-word entries: keep if they look like headings
+            # Either all caps (section headers) or title case (chapter names)
+            elif word_count > 1:
+                # Check if it's title case (first letter of each word capitalized)
+                is_title_case = all(word[0].isupper() if word else False for word in line.split() if len(word) > 2)
+                if line.isupper() or is_title_case:
+                    titles.append(line)
     
     # Try to match titles to page numbers
     toc_entries = []
@@ -259,7 +247,7 @@ def assign_toc_hierarchy(toc_entries):
     return toc_entries
 
 
-def find_heading_in_document(pdf_path, heading_title, expected_page, search_window=5, exclude_pages=None):
+def find_heading_in_document(pdf_path, heading_title, expected_page, search_window=5, exclude_pages=None, ocr_mode=False):
     """Find where a heading actually appears in the document."""
     doc = fitz.open(pdf_path)
     page_count = len(doc)
@@ -269,6 +257,32 @@ def find_heading_in_document(pdf_path, heading_title, expected_page, search_wind
     if exclude_pages:
         exclude_page_nums = {p - 1 if p > 0 else p for p in exclude_pages}
     
+    # In OCR mode, do exact text search across entire document
+    if ocr_mode:
+        # Normalize the search title (collapse whitespace, case-insensitive)
+        search_title = ' '.join(heading_title.strip().split()).lower()
+        
+        for page_num in range(page_count):
+            # Skip TOC pages
+            if page_num in exclude_page_nums:
+                continue
+            
+            page = doc[page_num]
+            text = page.get_text()
+            
+            # Normalize page text (collapse whitespace, case-insensitive)
+            normalized_text = ' '.join(text.split()).lower()
+            
+            # Check for exact match
+            if search_title in normalized_text:
+                doc.close()
+                return page_num + 1, 1.0  # Exact match found
+        
+        # No exact match found
+        doc.close()
+        return None, 0.0
+    
+    # Standard mode: use fuzzy matching with search window
     normalized_title = re.sub(r'\s+', ' ', heading_title.lower().strip())
     normalized_title = re.sub(r'[^\w\s]', '', normalized_title)
     
@@ -343,13 +357,19 @@ def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False)
             pdf_path, 
             entry["title"], 
             entry["page"],
-            exclude_pages=exclude_pages
+            exclude_pages=exclude_pages,
+            ocr_mode=ocr_mode
         )
         
-        # In OCR mode, only include entries with good matches (>0.85 score)
-        # This ensures we only add bookmarks for content that actually exists in the document
-        # Higher threshold prevents false matches from common word overlap
-        if ocr_mode and match_score < 0.85:
+        # In OCR mode, skip entries where no exact match was found
+        if ocr_mode and (actual_page is None or match_score < 1.0):
+            skipped_entries.append({"title": entry["title"], "score": match_score})
+            if (i + 1) % 10 == 0:
+                print(f"  Processed {i + 1}/{len(toc_entries)} entries...")
+            continue
+        
+        # In non-OCR mode, use threshold of 0.85
+        if not ocr_mode and match_score < 0.85:
             skipped_entries.append({"title": entry["title"], "score": match_score})
             if (i + 1) % 10 == 0:
                 print(f"  Processed {i + 1}/{len(toc_entries)} entries...")
