@@ -144,51 +144,70 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
     """
     Extract TOC from OCR'd PDFs where titles and page numbers are on separate lines.
     This handles cases where the TOC has all titles first, then all page numbers.
+    Also captures x-position (indentation) for hierarchy detection.
     """
     doc = fitz.open(pdf_path)
     
     all_lines = []
     
-    # Collect all text lines from TOC pages
+    # Collect all text lines from TOC pages with layout information
     for toc_page_num in toc_page_nums:
         page = doc[toc_page_num]
-        text = page.get_text()
-        lines = [l.strip() for l in text.split('\n') if l.strip()]
-        all_lines.extend(lines)
+        blocks = page.get_text("dict")["blocks"]
+        for block in blocks:
+            if "lines" in block:
+                for line in block["lines"]:
+                    # Get the x0 position (left edge) for indentation detection
+                    x0 = line["bbox"][0]
+                    text = ""
+                    for span in line["spans"]:
+                        text += span["text"]
+                    if text.strip():
+                        all_lines.append({"text": text.strip(), "x0": x0})
     
     doc.close()
     
     # Skip the "TABLE OF CONTENTS" header
-    all_lines = [l for l in all_lines if not re.match(r'^(table\s+of\s+)?contents$', l, re.IGNORECASE)]
+    all_lines = [l for l in all_lines if not re.match(r'^(table\s+of\s+)?contents$', l["text"], re.IGNORECASE)]
     
     # Separate potential titles from page numbers
     # Keep it simple: treat each line as either a title or page number
-    titles = []
+    titles = []  # Now stores {"text": ..., "x0": ...}
     page_numbers = []
     
     for line in all_lines:
+        text = line["text"]
+        x0 = line["x0"]
+        
         # Check if line is just a number (page number)
-        if re.match(r'^\d+$', line):
-            page_numbers.append(int(line))
+        if re.match(r'^\d+$', text):
+            page_numbers.append(int(text))
         # Check if line is a separator or garbled text - skip it
-        elif re.match(r'^[—_\-\s]+$|^[a-z]{1,3}\s+[A-Z][a-z]\s+', line):
+        elif re.match(r'^[—_\-\s]+$|^[a-z]{1,3}\s+[A-Z][a-z]\s+', text):
             continue
         # Otherwise treat as title
-        elif not line.isdigit():
-            word_count = len(line.split())
+        elif not text.isdigit():
+            word_count = len(text.split())
             # For single words: only keep if they're ALL CAPS and look like section markers
             # Skip common words like "WRITING", "LOGIC", "PART"
             if word_count == 1:
-                common_words = {'PART', 'LOGIC', 'WRITING', 'CHAPTER', 'SECTION'}
-                if line.isupper() and len(line) >= 7 and line not in common_words:
-                    titles.append(line)
+                common_words = {'PART', 'LOGIC', 'WRITING', 'CHAPTER', 'SECTION', '|'}
+                if text.isupper() and len(text) >= 7 and text not in common_words:
+                    titles.append({"text": text, "x0": x0})
             # For multi-word entries: keep if they look like headings
             # Either all caps (section headers) or title case (chapter names)
             elif word_count > 1:
-                # Check if it's title case (first letter of each word capitalized)
-                is_title_case = all(word[0].isupper() if word else False for word in line.split() if len(word) > 2)
-                if line.isupper() or is_title_case:
-                    titles.append(line)
+                # Check if it's title case (first letter of significant words capitalized)
+                # Skip short connector words like "the", "of", "into", "from" which are often lowercase
+                significant_words = [w for w in text.split() if len(w) > 4]
+                if significant_words:
+                    is_title_case = all(word[0].isupper() for word in significant_words)
+                else:
+                    # For titles with only short words, just check if first word is capitalized
+                    is_title_case = text[0].isupper()
+                
+                if text.isupper() or is_title_case:
+                    titles.append({"text": text, "x0": x0})
     
     # Try to match titles to page numbers
     toc_entries = []
@@ -213,12 +232,13 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
         
         if num_matches > 0:
             for i in range(num_matches):
+                title_info = titles[i]
                 toc_entries.append({
-                    "title": titles[i],
+                    "title": title_info["text"],
                     "page": page_numbers[i],
-                    "indent": 0,  # Can't determine from OCR
+                    "indent": title_info["x0"],  # Use x-position as indentation
                     "font_size": 12.0,  # Default
-                    "original_text": titles[i]
+                    "original_text": title_info["text"]
                 })
             
             print(f"✓ Matched {len(toc_entries)} entries using OCR-style extraction")
@@ -231,11 +251,42 @@ def assign_toc_hierarchy(toc_entries):
     if not toc_entries:
         return []
     
+    # Get unique indent values
     indents = sorted(set(entry["indent"] for entry in toc_entries))
+    
+    # If we have many unique indents (e.g., from x-positions), cluster them into levels
+    if len(indents) > 5:
+        # First, filter out outlier indents used by very few entries (< 3% of total)
+        indent_counts = {}
+        for entry in toc_entries:
+            indent_counts[entry["indent"]] = indent_counts.get(entry["indent"], 0) + 1
+        
+        min_count = 2  # At least 2 entries to avoid single outliers
+        common_indents = [indent for indent in indents if indent_counts[indent] >= min_count]
+        
+        if common_indents:
+            indents = common_indents
+        
+        # Use simple clustering: group indents within 2 units of each other
+        clustered = []
+        for indent in indents:
+            # Find existing cluster within 2 units
+            found = False
+            for i, cluster_val in enumerate(clustered):
+                if abs(indent - cluster_val) < 2:
+                    found = True
+                    break
+            if not found:
+                clustered.append(indent)
+        
+        indents = sorted(clustered)
+    
     font_sizes = sorted(set(entry["font_size"] for entry in toc_entries), reverse=True)
     
     for entry in toc_entries:
-        indent_score = indents.index(entry["indent"])
+        # Find the closest indent cluster
+        closest_indent = min(indents, key=lambda x: abs(x - entry["indent"]))
+        indent_score = indents.index(closest_indent)
         font_score = font_sizes.index(entry["font_size"])
         entry["hierarchy_score"] = indent_score + (font_score * 0.5)
     
@@ -342,13 +393,20 @@ def find_heading_in_document(pdf_path, heading_title, expected_page, search_wind
     return min(expected_page, page_count), best_match_score
 
 
-def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False):
+def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False, approximate_missing=False):
     """Match TOC entries to actual locations in the document."""
     matched_entries = []
     skipped_entries = []
+    all_entries_with_status = []  # Track all entries with found/not found status
     
     # Convert toc_pages to 1-indexed list for exclude_pages
-    exclude_pages = [p + 1 for p in toc_pages] if toc_pages else None
+    # Also exclude the first few pages (likely copyright, title page, etc.) to avoid false matches
+    if toc_pages:
+        first_toc_page = min(toc_pages) + 1  # +1 for 1-indexed
+        # Exclude pages 1-3 (typical frontmatter) and the TOC pages themselves
+        exclude_pages = list(range(1, min(4, first_toc_page))) + [p + 1 for p in toc_pages]
+    else:
+        exclude_pages = None
     
     print(f"\nMatching {len(toc_entries)} TOC entries to document...")
     
@@ -361,16 +419,28 @@ def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False)
             ocr_mode=ocr_mode
         )
         
-        # In OCR mode, skip entries where no exact match was found
+        # Store entry with its search result
+        entry_with_status = {
+            "title": entry["title"],
+            "page": actual_page,
+            "level": entry["level"],
+            "toc_page": entry["page"],
+            "match_score": match_score,
+            "found": False
+        }
+        
+        # In OCR mode, check if exact match was found
         if ocr_mode and (actual_page is None or match_score < 1.0):
-            skipped_entries.append({"title": entry["title"], "score": match_score})
+            skipped_entries.append({"title": entry["title"], "score": match_score, "index": i})
+            all_entries_with_status.append(entry_with_status)
             if (i + 1) % 10 == 0:
                 print(f"  Processed {i + 1}/{len(toc_entries)} entries...")
             continue
         
         # In non-OCR mode, use threshold of 0.85
         if not ocr_mode and match_score < 0.85:
-            skipped_entries.append({"title": entry["title"], "score": match_score})
+            skipped_entries.append({"title": entry["title"], "score": match_score, "index": i})
+            all_entries_with_status.append(entry_with_status)
             if (i + 1) % 10 == 0:
                 print(f"  Processed {i + 1}/{len(toc_entries)} entries...")
             continue
@@ -383,6 +453,8 @@ def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False)
             "match_score": match_score
         }
         
+        entry_with_status["found"] = True
+        all_entries_with_status.append(entry_with_status)
         matched_entries.append(matched_entry)
         
         if (i + 1) % 10 == 0:
@@ -396,7 +468,177 @@ def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False)
     
     print(f"✓ Matched {len(matched_entries)} entries to document pages")
     
+    # If approximate_missing is enabled and we have some matched entries, approximate the missing ones
+    if approximate_missing and matched_entries and skipped_entries:
+        approximated = approximate_missing_entries(all_entries_with_status, matched_entries, skipped_entries, pdf_path)
+        if approximated:
+            print(f"ℹ Approximated {len(approximated)} missing entries (marked with ★)")
+            # Merge approximated entries back into their correct TOC positions
+            # Rebuild the full list in original TOC order
+            full_list = []
+            # Map by original title (without star marker)
+            approx_dict = {}
+            for e in approximated:
+                original_title = e["title"].replace(" ★", "")
+                approx_dict[original_title] = e
+            
+            for entry in all_entries_with_status:
+                if entry["found"]:
+                    # Find the corresponding matched entry
+                    matched = next((m for m in matched_entries if m["title"] == entry["title"]), None)
+                    if matched:
+                        full_list.append(matched)
+                elif entry["title"] in approx_dict:
+                    # Use the approximated entry
+                    full_list.append(approx_dict[entry["title"]])
+            
+            matched_entries = full_list
+    
     return matched_entries
+
+
+def approximate_missing_entries(all_entries, matched_entries, skipped_entries, pdf_path=None):
+    """Approximate page numbers for entries that weren't found based on nearby matches.
+    
+    Uses TOC page numbers to understand spacing between sections and makes intelligent
+    approximations. Skips entries that would be beyond the PDF page count.
+    """
+    approximated = []
+    
+    # Get PDF page count to avoid approximating beyond it
+    pdf_page_count = None
+    if pdf_path:
+        import fitz
+        doc = fitz.open(pdf_path)
+        pdf_page_count = doc.page_count
+        doc.close()
+    
+    # Create a map of found entries by their index in the original list
+    found_map = {}
+    toc_page_map = {}  # Map of index to TOC page number
+    for i, entry in enumerate(all_entries):
+        toc_page_map[i] = entry.get("toc_page", 0)
+        if entry["found"]:
+            found_map[i] = entry["page"]
+    
+    if not found_map:
+        return approximated
+    
+    # For each skipped entry, find nearest found entries and interpolate
+    for skip_info in skipped_entries:
+        idx = skip_info["index"]
+        entry = all_entries[idx]
+        toc_page = entry.get("toc_page", 0)
+        
+        # Find the nearest found entry before and after this index
+        before_idx = None
+        before_page = None
+        before_toc_page = None
+        for i in range(idx - 1, -1, -1):
+            if i in found_map:
+                before_idx = i
+                before_page = found_map[i]
+                before_toc_page = toc_page_map.get(i, 0)
+                break
+        
+        after_idx = None
+        after_page = None
+        after_toc_page = None
+        for i in range(idx + 1, len(all_entries)):
+            if i in found_map:
+                after_idx = i
+                after_page = found_map[i]
+                after_toc_page = toc_page_map.get(i, 0)
+                break
+        
+        # ONLY approximate entries that fall between two found entries (interpolation)
+        # Skip extrapolation to avoid creating bookmarks to non-existent content
+        approx_page = None
+        
+        if before_idx is not None and after_idx is not None:
+            # We have found entries both before and after - safe to interpolate
+            # Use TOC page differences to guide interpolation
+            toc_diff_total = after_toc_page - before_toc_page if after_toc_page and before_toc_page else 0
+            toc_diff_to_here = toc_page - before_toc_page if toc_page and before_toc_page else 0
+            
+            if toc_diff_total > 0 and toc_diff_to_here > 0:
+                # Use TOC spacing ratio for intelligent interpolation
+                pdf_page_diff = after_page - before_page
+                ratio = toc_diff_to_here / toc_diff_total
+                approx_page = before_page + int(pdf_page_diff * ratio)
+            else:
+                # Fall back to simple linear interpolation by index
+                idx_diff = after_idx - before_idx
+                page_diff = after_page - before_page
+                position = idx - before_idx
+                approx_page = before_page + int((page_diff * position) / idx_diff)
+        else:
+            # Cannot approximate - need entries both before AND after for safe interpolation
+            # Skip extrapolation to avoid false bookmarks
+            continue
+        
+        # Validate the approximation
+        if approx_page and approx_page > 0:
+            # Skip if approximation exceeds PDF page count
+            if pdf_page_count and approx_page > pdf_page_count:
+                continue
+                
+            # Skip if approximation is not reasonable (too far from found entries)
+            if before_page and approx_page > before_page + 10:  # More than 10 pages away seems unreasonable
+                continue
+            if after_page and approx_page < after_page - 10:
+                continue
+            
+            # Check if this page conflicts with an already-found entry
+            occupied_pages = set(found_map.values())
+            if approx_page in occupied_pages and entry.get("level", 1) == 1:
+                # Try to find a nearby unoccupied page
+                if approx_page + 1 not in occupied_pages and (not pdf_page_count or approx_page + 1 <= pdf_page_count):
+                    approx_page = approx_page + 1
+                elif approx_page - 1 not in occupied_pages and approx_page - 1 >= 1:
+                    approx_page = approx_page - 1
+                else:
+                    # Can't find a good alternative, skip this approximation
+                    continue
+            
+            # VALIDATE: Search the approximated page for the entry title
+            # Only keep approximation if we find similar text on that page
+            validation_score = 0.0
+            if pdf_path:
+                import fitz
+                doc = fitz.open(pdf_path)
+                if 0 <= approx_page - 1 < len(doc):
+                    page_text = doc[approx_page - 1].get_text()
+                    # Normalize and check for fuzzy match
+                    normalized_title = ' '.join(entry["title"].strip().split()).lower()
+                    normalized_page = ' '.join(page_text.split()).lower()
+                    
+                    # Check if title appears in page text (fuzzy)
+                    if normalized_title in normalized_page:
+                        validation_score = 1.0
+                    else:
+                        # Try partial match - at least 50% of words should match
+                        title_words = set(normalized_title.split())
+                        page_words = set(normalized_page.split())
+                        if title_words and page_words:
+                            overlap = len(title_words & page_words) / len(title_words)
+                            validation_score = overlap
+                doc.close()
+            
+            # Only keep approximation if validation score is reasonable (>= 0.5)
+            if validation_score < 0.5:
+                continue
+            
+            approximated.append({
+                "title": entry["title"] + " ★",  # Add star to indicate approximation
+                "page": approx_page,
+                "level": entry["level"],
+                "toc_page": entry["toc_page"],
+                "match_score": validation_score,
+                "approximated": True
+            })
+    
+    return approximated
 
 
 def extract_text_with_formatting(pdf_path):
@@ -597,7 +839,7 @@ def add_toc_to_pdf(input_pdf_path, output_pdf_path, toc):
 
 def generate_pdf_toc(input_pdf_path, output_pdf_path=None, 
                      use_existing_toc=True, flat_structure=False,
-                     add_toc_bookmark=True, use_ocr_mode=False):
+                     add_toc_bookmark=True, use_ocr_mode=False, approximate_missing=None):
     """Complete workflow to generate TOC for a PDF."""
     print("=" * 80)
     print("PDF TABLE OF CONTENTS GENERATOR")
@@ -607,6 +849,10 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
     if output_pdf_path is None:
         path = Path(input_pdf_path)
         output_pdf_path = str(path.parent / f"{path.stem}_with_toc{path.suffix}")
+    
+    # Default: enable approximation in OCR mode if not explicitly set
+    if approximate_missing is None:
+        approximate_missing = use_ocr_mode
     
     headings = None
     method_used = None
@@ -630,7 +876,7 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
                 toc_entries = assign_toc_hierarchy(toc_entries)
                 
                 print("Step 4: Matching TOC entries to document pages...")
-                matched_entries = match_toc_to_document(input_pdf_path, toc_entries, toc_page_nums, use_ocr_mode)
+                matched_entries = match_toc_to_document(input_pdf_path, toc_entries, toc_page_nums, use_ocr_mode, approximate_missing)
                 
                 headings = matched_entries
                 method_used = "existing_toc"
@@ -663,24 +909,43 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
     if method_used == "existing_toc":
         toc = []
         
-        # Build initial TOC, filtering out entries that would violate page order
-        # Process in TOC order, but skip entries whose page number doesn't increase
+        # Build initial TOC with smart handling of orphaned children
+        # When an entry has no parent, promote it to top level
         prev_page = 0
         skipped_count = 0
+        last_level_1_idx = -1  # Track index of last level 1 entry
         
-        for entry in headings:
+        for i, entry in enumerate(headings):
             page = entry["page"]
+            level = entry["level"]
             
             # Skip if page doesn't increase (violates bookmark ordering requirement)
             if page <= prev_page:
                 skipped_count += 1
                 continue
-                
+            
+            # Check if this entry has a valid parent
+            adjusted_level = level
+            if level > 1:
+                # Check if there's a recent level 1 entry that could be the parent
+                # If the last level 1 entry is far away or this follows many other level 2s,
+                # promote to level 1
+                if last_level_1_idx == -1:
+                    # No level 1 entry yet, promote
+                    adjusted_level = 1
+                elif len(toc) - last_level_1_idx > 5:
+                    # Too many entries since last level 1, likely a new section - promote
+                    adjusted_level = 1
+            
             toc.append([
-                entry["level"],
+                adjusted_level,
                 entry["title"],
                 page
             ])
+            
+            if adjusted_level == 1:
+                last_level_1_idx = len(toc) - 1
+            
             prev_page = page
         
         if skipped_count > 0:
@@ -697,11 +962,6 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
                 else:
                     break
             toc.insert(insert_pos, [1, "Table of Contents", toc_page])
-            
-            # Adjust levels of entries after TOC bookmark
-            for i in range(len(toc)):
-                if i != insert_pos:  # Don't adjust the TOC bookmark itself
-                    toc[i][0] += 1
         
         toc = normalize_toc_hierarchy(toc)
     else:
@@ -870,6 +1130,11 @@ Examples:
         action="store_true",
         help="Use OCR mode for poorly scanned PDFs (enhanced extraction for separated titles/page numbers)"
     )
+    parser.add_argument(
+        "--approximate",
+        action="store_true",
+        help="Approximate page numbers for TOC entries that can't be found exactly (useful for excerpts)"
+    )
     
     args = parser.parse_args()
     
@@ -895,7 +1160,8 @@ Examples:
             use_existing_toc=not args.no_existing_toc,
             flat_structure=args.flat,
             add_toc_bookmark=not args.no_toc_bookmark,
-            use_ocr_mode=args.ocr_mode
+            use_ocr_mode=args.ocr_mode,
+            approximate_missing=args.approximate if args.approximate else None
         )
 
 
