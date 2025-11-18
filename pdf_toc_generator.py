@@ -140,6 +140,119 @@ def extract_toc_from_page(pdf_path, toc_page_nums, use_ocr_mode=False):
     return toc_entries
 
 
+def get_visual_lines(page):
+    """
+    Reconstruct visual lines from a page by clustering text segments based on vertical overlap.
+    Returns a list of dicts, where each dict represents a full visual line with 'text' and 'x0'.
+    """
+    blocks = page.get_text("dict")["blocks"]
+    segments = []
+    
+    # 1. Flatten all text segments from all blocks
+    for block in blocks:
+        if "lines" in block:
+            for line in block["lines"]:
+                text = "".join(s["text"] for s in line["spans"]).strip()
+                if text:
+                    segments.append({
+                        "text": text,
+                        "bbox": line["bbox"],
+                        "height": line["bbox"][3] - line["bbox"][1]
+                    })
+    
+    # 2. Sort segments by vertical position (top edge)
+    segments.sort(key=lambda s: s["bbox"][1])
+    
+    # 3. Cluster into visual lines
+    visual_lines = []
+    
+    for seg in segments:
+        # Try to find an existing line this segment belongs to
+        matched = False
+        for v_line in visual_lines:
+            # Check vertical overlap
+            line_top = v_line["bbox"][1]
+            line_bottom = v_line["bbox"][3]
+            seg_top = seg["bbox"][1]
+            seg_bottom = seg["bbox"][3]
+            
+            overlap_top = max(line_top, seg_top)
+            overlap_bottom = min(line_bottom, seg_bottom)
+            overlap = max(0, overlap_bottom - overlap_top)
+            
+            # Check if overlap is significant relative to the segment height
+            if overlap > 0.5 * seg["height"]:
+                v_line["segments"].append(seg)
+                # Update line bbox to include this segment
+                v_line["bbox"] = (
+                    min(v_line["bbox"][0], seg["bbox"][0]),
+                    min(v_line["bbox"][1], seg["bbox"][1]),
+                    max(v_line["bbox"][2], seg["bbox"][2]),
+                    max(v_line["bbox"][3], seg["bbox"][3])
+                )
+                matched = True
+                break
+        
+        if not matched:
+            # Start a new visual line
+            visual_lines.append({
+                "segments": [seg],
+                "bbox": seg["bbox"]
+            })
+    
+    # 4. Sort lines by Y-position
+    visual_lines.sort(key=lambda l: l["bbox"][1])
+    
+    # 5. Construct text for each line
+    final_lines = []
+    for v_line in visual_lines:
+        # Sort segments in the line by X-position
+        v_line["segments"].sort(key=lambda s: s["bbox"][0])
+        
+        # Join text
+        full_text = " ".join(s["text"] for s in v_line["segments"])
+        final_lines.append({
+            "text": full_text,
+            "x0": v_line["bbox"][0] # Keep indentation info
+        })
+        
+    return final_lines
+
+
+def clean_ocr_page_num(text):
+    """Clean OCR'd page number text."""
+    # Remove spaces
+    text = text.replace(" ", "")
+    
+    # Common OCR substitutions
+    replacements = {
+        'I': '1', 'l': '1', 'i': '1', '|': '1',
+        'O': '0', 'o': '0',
+        'S': '5', 's': '5',
+        'B': '8',
+        'Z': '2'
+    }
+    
+    # If it's already digits, return int
+    if text.isdigit():
+        return int(text)
+        
+    # Apply replacements
+    cleaned = ""
+    for char in text:
+        if char.isdigit():
+            cleaned += char
+        elif char in replacements:
+            cleaned += replacements[char]
+        else:
+            # If we encounter an unknown char, it's probably not a number
+            return None
+            
+    if cleaned and cleaned.isdigit():
+        return int(cleaned)
+    return None
+
+
 def extract_toc_ocr_style(pdf_path, toc_page_nums):
     """
     Extract TOC from OCR'd PDFs where titles and page numbers are on separate lines.
@@ -147,23 +260,16 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
     Also captures x-position (indentation) for hierarchy detection.
     """
     doc = fitz.open(pdf_path)
+    page_count = doc.page_count
     
     all_lines = []
     
     # Collect all text lines from TOC pages with layout information
     for toc_page_num in toc_page_nums:
         page = doc[toc_page_num]
-        blocks = page.get_text("dict")["blocks"]
-        for block in blocks:
-            if "lines" in block:
-                for line in block["lines"]:
-                    # Get the x0 position (left edge) for indentation detection
-                    x0 = line["bbox"][0]
-                    text = ""
-                    for span in line["spans"]:
-                        text += span["text"]
-                    if text.strip():
-                        all_lines.append({"text": text.strip(), "x0": x0})
+        # Use visual line reconstruction instead of raw blocks
+        visual_lines = get_visual_lines(page)
+        all_lines.extend(visual_lines)
     
     doc.close()
     
@@ -171,77 +277,89 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
     all_lines = [l for l in all_lines if not re.match(r'^(table\s+of\s+)?contents$', l["text"], re.IGNORECASE)]
     
     # Separate potential titles from page numbers
-    # Keep it simple: treat each line as either a title or page number
-    titles = []  # Now stores {"text": ..., "x0": ...}
-    page_numbers = []
+    # Use a state machine approach to handle multi-line titles and split lines
+    toc_entries = []
+    current_title_lines = []
+    current_x0 = None
     
     for line in all_lines:
         text = line["text"]
         x0 = line["x0"]
         
-        # Check if line is just a number (page number)
-        if re.match(r'^\d+$', text):
-            page_numbers.append(int(text))
-        # Check if line is a separator or garbled text - skip it
-        elif re.match(r'^[—_\-\s]+$|^[a-z]{1,3}\s+[A-Z][a-z]\s+', text):
-            continue
-        # Otherwise treat as title
-        elif not text.isdigit():
-            word_count = len(text.split())
-            # For single words: only keep if they're ALL CAPS and look like section markers
-            # Skip common words like "WRITING", "LOGIC", "PART"
-            if word_count == 1:
-                common_words = {'PART', 'LOGIC', 'WRITING', 'CHAPTER', 'SECTION', '|'}
-                if text.isupper() and len(text) >= 7 and text not in common_words:
-                    titles.append({"text": text, "x0": x0})
-            # For multi-word entries: keep if they look like headings
-            # Either all caps (section headers) or title case (chapter names)
-            elif word_count > 1:
-                # Check if it's title case (first letter of significant words capitalized)
-                # Skip short connector words like "the", "of", "into", "from" which are often lowercase
-                significant_words = [w for w in text.split() if len(w) > 4]
-                if significant_words:
-                    is_title_case = all(word[0].isupper() for word in significant_words)
-                else:
-                    # For titles with only short words, just check if first word is capitalized
-                    is_title_case = text[0].isupper()
-                
-                if text.isupper() or is_title_case:
-                    titles.append({"text": text, "x0": x0})
-    
-    # Try to match titles to page numbers
-    toc_entries = []
-    
-    if len(titles) > 0 and len(page_numbers) > 0:
-        # Match titles to page numbers 1-to-1
-        num_matches = min(len(titles), len(page_numbers))
+        # Check for page number
+        page_num = None
+        title_part = None
         
-        print(f"  Found {len(titles)} potential titles and {len(page_numbers)} page numbers")
-        
-        # Quick validation: check if page numbers are reasonable
-        doc = fitz.open(pdf_path)
-        page_count = doc.page_count
-        doc.close()
-        
-        out_of_range_count = sum(1 for p in page_numbers[:num_matches] if p > page_count)
-        
-        if out_of_range_count > num_matches * 0.5:
-            print(f"  ⚠ Warning: {out_of_range_count}/{num_matches} page numbers exceed PDF page count ({page_count})")
-            print(f"  This appears to be an excerpt or the TOC references the original document's page numbers.")
-            print(f"  Will use fuzzy matching to find headings in the available pages.")
-        
-        if num_matches > 0:
-            for i in range(num_matches):
-                title_info = titles[i]
-                toc_entries.append({
-                    "title": title_info["text"],
-                    "page": page_numbers[i],
-                    "indent": title_info["x0"],  # Use x-position as indentation
-                    "font_size": 12.0,  # Default
-                    "original_text": title_info["text"]
-                })
+        # 1. Standalone page number
+        cleaned = clean_ocr_page_num(text)
+        if cleaned is not None:
+            if cleaned <= page_count + 50:
+                page_num = cleaned
+            # If it's a number but invalid (too large), we treat it as garbage and ignore it
+            # We do NOT treat it as a title
+        else:
+            # 2. Trailing page number
+            match = re.search(r'^(.*)\s+([0-9IlOoSBZ]{1,4})$', text)
+            if match:
+                pot_num = clean_ocr_page_num(match.group(2))
+                if pot_num is not None and pot_num <= page_count + 50:
+                    page_num = pot_num
+                    title_part = match.group(1).strip()
             
-            print(f"✓ Matched {len(toc_entries)} entries using OCR-style extraction")
+            # 3. Just title
+            if page_num is None:
+                title_part = text
+        
+        # Logic to handle the parts
+        if title_part:
+            # Clean title part (fix wide spacing like "B I G B I L L")
+            # Replace "Letter Space" with "Letter" if followed by another letter
+            title_part = re.sub(r'\b([A-Z])\s+(?=[A-Z]\b)', r'\1', title_part)
+            
+            # Strip leading numbering (e.g. "1. ", "4. ")
+            title_part = re.sub(r'^\d+\.?\s*', '', title_part)
+            
+            # Validate title_part
+            is_valid_part = True
+            
+            # Filter out separators
+            if re.match(r'^[—_\-\s]+$|^[a-z]{1,3}\s+[A-Z][a-z]\s+', title_part):
+                is_valid_part = False
+            
+            # If starting a new entry, apply stricter checks
+            if not current_title_lines and is_valid_part:
+                word_count = len(title_part.split())
+                if word_count == 1:
+                    common_words = {'PART', 'LOGIC', 'WRITING', 'CHAPTER', 'SECTION', '|'}
+                    # Allow shorter words if they look like titles (e.g. "Index", "Notes")
+                    if not (title_part[0].isupper() and len(title_part) >= 3 and title_part not in common_words):
+                        is_valid_part = False
+                elif word_count > 1:
+                    # Check if it looks like text (not just symbols)
+                    if not any(c.isalpha() for c in title_part):
+                        is_valid_part = False
+            
+            if is_valid_part:
+                if not current_title_lines:
+                    current_x0 = x0
+                current_title_lines.append(title_part)
+            
+        if page_num is not None:
+            # We have a page number. This completes the entry.
+            if current_title_lines:
+                full_title = " ".join(current_title_lines)
+                toc_entries.append({
+                    "title": full_title,
+                    "page": page_num,
+                    "indent": current_x0,
+                    "font_size": 12.0,
+                    "original_text": full_title
+                })
+                # Reset
+                current_title_lines = []
+                current_x0 = None
+    
+    print(f"✓ Matched {len(toc_entries)} entries using OCR-style extraction")
     
     return toc_entries
 
@@ -302,34 +420,10 @@ def find_heading_in_document(pdf_path, heading_title, expected_page, search_wind
     if exclude_pages:
         exclude_page_nums = {p - 1 if p > 0 else p for p in exclude_pages}
     
-    # In OCR mode, do exact text search across entire document
-    if ocr_mode:
-        # Normalize the search title (collapse whitespace, case-insensitive)
-        search_title = ' '.join(heading_title.strip().split()).lower()
-        
-        for page_num in range(page_count):
-            # Skip TOC pages
-            if page_num in exclude_page_nums:
-                continue
-            
-            page = doc[page_num]
-            text = page.get_text()
-            
-            # Normalize page text (collapse whitespace, case-insensitive)
-            normalized_text = ' '.join(text.split()).lower()
-            
-            # Check for exact match
-            if search_title in normalized_text:
-                doc.close()
-                return page_num + 1, 1.0  # Exact match found
-        
-        # No exact match found
-        doc.close()
-        return None, 0.0
-    
-    # Standard mode: use fuzzy matching with search window
+    # Standard mode (and OCR fallback): use fuzzy matching with search window
     normalized_title = re.sub(r'\s+', ' ', heading_title.lower().strip())
     normalized_title = re.sub(r'[^\w\s]', '', normalized_title)
+    title_nospace = normalized_title.replace(" ", "")
     
     # If expected page is out of range, search the entire document
     if expected_page < 1 or expected_page > page_count:
@@ -352,9 +446,15 @@ def find_heading_in_document(pdf_path, heading_title, expected_page, search_wind
         normalized_text = re.sub(r'\s+', ' ', text)
         normalized_text = re.sub(r'[^\w\s]', '', normalized_text)
         
+        # Check 1: Standard substring match
         if normalized_title in normalized_text:
             doc.close()
             return page_num + 1, 1.0  # Perfect match
+            
+        # Check 2: Ignore spaces match (handles "BIGBILL" vs "BIG BILL")
+        if title_nospace and len(title_nospace) > 4 and title_nospace in normalized_text.replace(" ", ""):
+            doc.close()
+            return page_num + 1, 0.95  # Near perfect match
         
         title_words = set(normalized_title.split())
         text_words = set(normalized_text.split())
@@ -375,7 +475,7 @@ def find_heading_in_document(pdf_path, heading_title, expected_page, search_wind
         if match_score > best_match_score:
             best_match_score = match_score
             best_match_page = page_num + 1
-    
+            
     doc.close()
     
     # Use a lower threshold if we had to search the entire document
@@ -385,6 +485,52 @@ def find_heading_in_document(pdf_path, heading_title, expected_page, search_wind
         return best_match_page, best_match_score
     
     return min(expected_page, page_count), best_match_score
+
+
+def calculate_page_offset(pdf_path, toc_entries, exclude_pages=None):
+    """
+    Calculate the page offset between TOC page numbers and PDF page numbers.
+    Uses a sample of long, unique titles to find their actual locations in the PDF.
+    """
+    print("Calculating page offset...")
+    
+    # Filter for good candidates: long titles (more likely unique)
+    candidates = [e for e in toc_entries if len(e["title"]) > 15]
+    # Sort by length descending
+    candidates.sort(key=lambda x: len(x["title"]), reverse=True)
+    # Take top 10
+    candidates = candidates[:10]
+    
+    if not candidates:
+        return 0
+        
+    offsets = []
+    
+    for entry in candidates:
+        # Search entire document for this entry
+        # We use find_heading_in_document but force it to search everywhere by passing expected_page=-1
+        actual_page, score = find_heading_in_document(
+            pdf_path, 
+            entry["title"], 
+            -1, # Force full search
+            exclude_pages=exclude_pages,
+            ocr_mode=True # Use relaxed matching logic
+        )
+        
+        if score > 0.9: # High confidence match
+            offset = actual_page - entry["page"]
+            offsets.append(offset)
+            print(f"  Found offset {offset} for '{entry['title']}' (Page {entry['page']} -> {actual_page})")
+            
+    if not offsets:
+        print("  Could not determine offset (no high-confidence matches found)")
+        return 0
+        
+    # Return median offset
+    offsets.sort()
+    median_offset = offsets[len(offsets) // 2]
+    print(f"✓ Detected median page offset: {median_offset}")
+    return median_offset
 
 
 def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False, approximate_missing=False):
@@ -401,14 +547,20 @@ def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False,
         exclude_pages = list(range(1, min(4, first_toc_page))) + [p + 1 for p in toc_pages]
     else:
         exclude_pages = None
+        
+    # Calculate global page offset
+    page_offset = calculate_page_offset(pdf_path, toc_entries, exclude_pages)
     
     print(f"\nMatching {len(toc_entries)} TOC entries to document...")
     
     for i, entry in enumerate(toc_entries):
+        # Apply offset to expected page
+        expected_page = entry["page"] + page_offset
+        
         actual_page, match_score = find_heading_in_document(
             pdf_path, 
             entry["title"], 
-            entry["page"],
+            expected_page,
             exclude_pages=exclude_pages,
             ocr_mode=ocr_mode
         )
@@ -424,15 +576,10 @@ def match_toc_to_document(pdf_path, toc_entries, toc_pages=None, ocr_mode=False,
         }
         
         # In OCR mode, check if exact match was found
-        if ocr_mode and (actual_page is None or match_score < 1.0):
-            skipped_entries.append({"title": entry["title"], "score": match_score, "index": i})
-            all_entries_with_status.append(entry_with_status)
-            if (i + 1) % 10 == 0:
-                print(f"  Processed {i + 1}/{len(toc_entries)} entries...")
-            continue
+        # Relaxed threshold for OCR mode since we now allow fuzzy matching
+        threshold = 0.7 if ocr_mode else 0.85
         
-        # In non-OCR mode, use threshold of 0.85
-        if not ocr_mode and match_score < 0.85:
+        if match_score < threshold:
             skipped_entries.append({"title": entry["title"], "score": match_score, "index": i})
             all_entries_with_status.append(entry_with_status)
             if (i + 1) % 10 == 0:
