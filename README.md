@@ -19,7 +19,7 @@ Automatically generate and add bookmarks (table of contents) to PDF files. Suppo
 ### One-Line Execution (with UV)
 
 ```bash
-uvx --from git+https://github.com/YOUR_USERNAME/pdf_toc_generator pdf_toc_generator
+uvx --from git+https://github.com/sameerbajaj/pdf_toc_generator pdf_toc_generator
 ```
 
 This will:
@@ -36,13 +36,13 @@ This will:
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Run the tool directly (no installation needed)
-uvx --from git+https://github.com/YOUR_USERNAME/pdf_toc_generator pdf_toc_generator
+uvx --from git+https://github.com/sameerbajaj/pdf_toc_generator pdf_toc_generator
 ```
 
 #### Manual Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/pdf_toc_generator.git
+git clone https://github.com/sameerbajaj/pdf_toc_generator.git
 cd pdf_toc_generator
 uv sync
 uv run pdf_toc_generator.py
