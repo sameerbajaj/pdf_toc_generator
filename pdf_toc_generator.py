@@ -246,7 +246,7 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
     return toc_entries
 
 
-def assign_toc_hierarchy(toc_entries):
+def assign_toc_hierarchy(toc_entries, use_ocr_mode=False):
     """Assign hierarchy levels based on indentation and font size."""
     if not toc_entries:
         return []
@@ -255,14 +255,16 @@ def assign_toc_hierarchy(toc_entries):
     
     # Check if we have x-position based indents (large values > 100)
     # These come from OCR mode and need clustering
-    if indents and max(indents) > 100:
-        # Cluster similar x-positions within 5 units
+    # ONLY apply this clustering in OCR mode, as standard PDFs have precise coordinates
+    if use_ocr_mode and indents and max(indents) > 100:
+        # Cluster similar x-positions within 0.5 units to handle OCR noise
+        # while preserving small indentations (like 1.0 unit)
         clustered = []
         for indent in indents:
-            # Find existing cluster within 5 units
+            # Find existing cluster within 0.5 units
             found_cluster = None
             for cluster in clustered:
-                if abs(indent - cluster) <= 5:
+                if abs(indent - cluster) <= 0.5:
                     found_cluster = cluster
                     break
             if found_cluster is None:
@@ -273,7 +275,7 @@ def assign_toc_hierarchy(toc_entries):
     
     for entry in toc_entries:
         # For clustered indents, find the closest cluster
-        if indents and max(indents) > 100:
+        if use_ocr_mode and indents and max(indents) > 100:
             closest_indent = min(indents, key=lambda x: abs(x - entry["indent"]))
             indent_score = indents.index(closest_indent)
         else:
@@ -868,7 +870,7 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
             
             if toc_entries:
                 print("Step 3: Assigning hierarchy to TOC entries...")
-                toc_entries = assign_toc_hierarchy(toc_entries)
+                toc_entries = assign_toc_hierarchy(toc_entries, use_ocr_mode)
                 
                 print("Step 4: Matching TOC entries to document pages...")
                 matched_entries = match_toc_to_document(input_pdf_path, toc_entries, toc_page_nums, use_ocr_mode, approximate_missing)
@@ -903,48 +905,37 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
     
     if method_used == "existing_toc":
         # Compress levels to consecutive integers starting from 1
-        # This handles cases where filtering removed intermediate levels
+        # This handles cases where filtering or sparse levels (OCR) created gaps
         unique_levels = sorted(set(h["level"] for h in headings))
         level_map = {old: new for new, old in enumerate(unique_levels, 1)}
         
         toc = []
         
-        # Build initial TOC with smart handling of orphaned children
-        # When an entry has no parent, promote to top level
+        # Determine level offset
+        # If we're adding a TOC bookmark, shift everything down by 1 level
+        # so they become children of the TOC (or siblings if normalized later)
+        level_offset = 1 if toc_page_nums and add_toc_bookmark else 0
+        
         prev_page = 0
         skipped_count = 0
-        last_level_1_idx = -1  # Track index of last level 1 entry
         
-        for i, entry in enumerate(headings):
+        for entry in headings:
             page = entry["page"]
-            level = level_map[entry["level"]]  # Apply level compression
             
-            # Skip if page doesn't increase (violates bookmark ordering requirement)
-            if page <= prev_page:
+            # Skip if page decreases (violates bookmark ordering requirement)
+            # Note: Multiple bookmarks on the same page are allowed
+            if page < prev_page:
                 skipped_count += 1
                 continue
             
-            # Check if this entry has a valid parent
-            adjusted_level = level
-            if level > 1:
-                # Check if there's a recent level 1 entry that could be the parent
-                # If the last level 1 entry is far away or this follows many other level 2s,
-                # promote to level 1
-                if last_level_1_idx == -1:
-                    # No level 1 entry yet, promote
-                    adjusted_level = 1
-                elif len(toc) - last_level_1_idx > 5:
-                    # Too many entries since last level 1, likely a new section - promote
-                    adjusted_level = 1
+            # Apply level compression and offset
+            level = level_map[entry["level"]] + level_offset
             
             toc.append([
-                adjusted_level,
+                level,
                 entry["title"],
                 page
             ])
-            
-            if adjusted_level == 1:
-                last_level_1_idx = len(toc) - 1
             
             prev_page = page
         
@@ -962,7 +953,7 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
                 else:
                     break
             toc.insert(insert_pos, [1, "Table of Contents", toc_page])
-        
+            
         toc = normalize_toc_hierarchy(toc)
     else:
         toc = generate_toc_structure(headings)
