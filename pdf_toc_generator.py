@@ -532,10 +532,22 @@ def interactive_mode():
     print()
     
     # Get PDF path
-    pdf_path = get_user_input("Enter the path to your PDF file")
+    pdf_path_input = get_user_input("Enter the path to your PDF file")
+    
+    # Clean up the path: expand user, remove quotes, handle escaped spaces
+    pdf_path = pdf_path_input.strip()
+    # Remove surrounding quotes if present
+    if (pdf_path.startswith('"') and pdf_path.endswith('"')) or \
+       (pdf_path.startswith("'") and pdf_path.endswith("'")):
+        pdf_path = pdf_path[1:-1]
+    # Replace escaped spaces with regular spaces
+    pdf_path = pdf_path.replace('\\ ', ' ')
+    # Expand ~ to home directory
+    pdf_path = str(Path(pdf_path).expanduser())
     
     if not Path(pdf_path).exists():
         print(f"Error: File not found: {pdf_path}")
+        print(f"(You entered: {pdf_path_input})")
         sys.exit(1)
     
     # Get output path
@@ -625,12 +637,20 @@ Examples:
     if not args.input_pdf:
         interactive_mode()
     else:
-        if not Path(args.input_pdf).exists():
-            print(f"Error: File not found: {args.input_pdf}")
+        # Clean up the input path
+        input_path = args.input_pdf.strip()
+        if (input_path.startswith('"') and input_path.endswith('"')) or \
+           (input_path.startswith("'") and input_path.endswith("'")):
+            input_path = input_path[1:-1]
+        input_path = input_path.replace('\\ ', ' ')
+        input_path = str(Path(input_path).expanduser())
+        
+        if not Path(input_path).exists():
+            print(f"Error: File not found: {input_path}")
             sys.exit(1)
         
         generate_pdf_toc(
-            args.input_pdf,
+            input_path,
             args.output,
             use_existing_toc=not args.no_existing_toc,
             flat_structure=args.flat,
