@@ -214,6 +214,7 @@ def get_visual_lines(page):
         final_lines.append({
             "text": full_text,
             "x0": v_line["bbox"][0], # Keep indentation info
+            "bbox": v_line["bbox"],
             "segments": v_line["segments"]
         })
         
@@ -291,10 +292,12 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
     toc_entries = []
     current_title_lines = []
     current_x0 = None
+    last_y_bottom = None
     
     for line in all_lines:
         text = line["text"]
         x0 = line["x0"]
+        bbox = line.get("bbox")
         segments = line.get("segments", [])
         
         # Check for page number
@@ -393,9 +396,23 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
                         is_valid_part = False
             
             if is_valid_part:
+                # Check vertical gap to detect if we should reset
+                # This handles cases where we have headers like "PART 1" (no page num)
+                # followed by a large gap before the next item.
+                if bbox and last_y_bottom is not None:
+                    this_y_top = bbox[1]
+                    gap = this_y_top - last_y_bottom
+                    # If gap is large (e.g. > 20 units), assume the previous lines were orphaned headers
+                    if gap > 20:
+                        current_title_lines = []
+                        current_x0 = None
+                
                 if not current_title_lines:
                     current_x0 = x0
                 current_title_lines.append(title_part)
+                
+                if bbox:
+                    last_y_bottom = bbox[3]
             
         if page_num is not None:
             # We have a page number. This completes the entry.
@@ -411,6 +428,7 @@ def extract_toc_ocr_style(pdf_path, toc_page_nums):
                 # Reset
                 current_title_lines = []
                 current_x0 = None
+                last_y_bottom = None
     
     print(f"✓ Matched {len(toc_entries)} entries using OCR-style extraction")
     
