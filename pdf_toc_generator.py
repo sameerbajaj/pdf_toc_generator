@@ -1064,7 +1064,7 @@ def add_toc_to_pdf(input_pdf_path, output_pdf_path, toc):
             entry[2] = 1
     
     doc.set_toc(toc)
-    doc.save(output_pdf_path, garbage=4, deflate=True)
+    doc.save(output_pdf_path, garbage=3, deflate=True)
     doc.close()
     
     print(f"✓ Added {len(toc)} bookmarks to PDF")
