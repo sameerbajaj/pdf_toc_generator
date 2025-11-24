@@ -1049,6 +1049,33 @@ def normalize_toc_hierarchy(toc):
     return normalized
 
 
+def cap_toc_depth(toc, max_depth):
+    """Cap TOC entries to a maximum depth level.
+    
+    Entries beyond max_depth are collapsed to max_depth level.
+    For example, with max_depth=3, all level 4, 5, 6+ entries become level 3.
+    
+    Args:
+        toc: List of [level, title, page] entries
+        max_depth: Maximum depth level (1 = only top-level entries)
+    
+    Returns:
+        TOC with capped depth levels
+    """
+    if not toc or max_depth is None:
+        return toc
+    
+    max_depth = max(1, int(max_depth))  # Ensure at least level 1
+    
+    capped = []
+    for entry in toc:
+        level, title, page = entry[0], entry[1], entry[2]
+        capped_level = min(level, max_depth)
+        capped.append([capped_level, title, page])
+    
+    return capped
+
+
 def add_toc_to_pdf(input_pdf_path, output_pdf_path, toc):
     """Add table of contents bookmarks to the PDF."""
     doc = fitz.open(input_pdf_path)
@@ -1073,8 +1100,13 @@ def add_toc_to_pdf(input_pdf_path, output_pdf_path, toc):
 
 def generate_pdf_toc(input_pdf_path, output_pdf_path=None, 
                      use_existing_toc=True, flat_structure=False,
-                     add_toc_bookmark=True, use_ocr_mode=False, approximate_missing=None):
-    """Complete workflow to generate TOC for a PDF."""
+                     add_toc_bookmark=True, use_ocr_mode=False, approximate_missing=None,
+                     max_depth=None):
+    """Complete workflow to generate TOC for a PDF.
+    
+    Args:
+        max_depth: Maximum depth of TOC hierarchy (None = no limit, 1 = flat, 2 = one level of subheadings, etc.)
+    """
     print("=" * 80)
     print("PDF TABLE OF CONTENTS GENERATOR")
     print("=" * 80)
@@ -1200,6 +1232,14 @@ def generate_pdf_toc(input_pdf_path, output_pdf_path=None,
         print("✓ Converting to flat structure (all entries at level 1)")
         toc = [[1, entry[1], entry[2]] for entry in toc]
     
+    # Apply depth limiting if requested
+    if max_depth is not None and not flat_structure:
+        original_levels = set(entry[0] for entry in toc)
+        toc = cap_toc_depth(toc, max_depth)
+        collapsed_count = sum(1 for entry in toc if entry[0] == max_depth and entry[0] in original_levels)
+        if max(original_levels) > max_depth:
+            print(f"✓ Capped TOC depth to {max_depth} levels (collapsed deeper entries)")
+    
     print(f"Generated TOC with {len(toc)} entries")
     print()
     
@@ -1295,6 +1335,22 @@ def interactive_mode():
         valid_values=["y", "n"]
     ).lower() == "y"
     
+    # Get max depth preference
+    max_depth = None
+    if not flat_structure:
+        depth_input = get_user_input(
+            "Maximum TOC depth (1-10, or press Enter for no limit)",
+            default="3"
+        )
+        try:
+            max_depth = int(depth_input) if depth_input else None
+            if max_depth is not None and (max_depth < 1 or max_depth > 10):
+                print("Invalid depth, using default of 3")
+                max_depth = 3
+        except ValueError:
+            print("Invalid input, using default of 3")
+            max_depth = 3
+    
     print()
     
     # Generate TOC
@@ -1304,7 +1360,8 @@ def interactive_mode():
         use_existing_toc=use_existing,
         flat_structure=flat_structure,
         add_toc_bookmark=add_toc_bookmark,
-        use_ocr_mode=use_ocr_mode
+        use_ocr_mode=use_ocr_mode,
+        max_depth=max_depth
     )
 
 
@@ -1363,6 +1420,12 @@ Examples:
         action="store_true",
         help="Approximate page numbers for TOC entries that can't be found exactly (useful for excerpts)"
     )
+    parser.add_argument(
+        "--max-depth",
+        type=int,
+        metavar="N",
+        help="Maximum TOC depth (1-10). Deeper entries are collapsed to this level. Default: no limit"
+    )
     
     args = parser.parse_args()
     
@@ -1389,7 +1452,8 @@ Examples:
             flat_structure=args.flat,
             add_toc_bookmark=not args.no_toc_bookmark,
             use_ocr_mode=args.ocr_mode,
-            approximate_missing=args.approximate if args.approximate else None
+            approximate_missing=args.approximate if args.approximate else None,
+            max_depth=args.max_depth
         )
 
 
