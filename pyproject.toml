@@ -8,7 +8,7 @@ dependencies = [
     "pymupdf>=1.23.0",
 ]
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Sameer Bajaj", email = "sameer@sameerbajaj.com"}
 ]
 license = "MIT"
 keywords = ["pdf", "table-of-contents", "bookmarks", "toc", "pymupdf"]
@@ -34,3 +34,6 @@ pdf_toc_generator = "pdf_toc_generator:main"
 
 [tool.setuptools]
 py-modules = ["pdf_toc_generator"]
+[project.urls]
+Homepage = "https://sameerbajaj.com/tools/pdf-toc/"
+Repository = "https://github.com/sameerbajaj/pdf_toc_generator"

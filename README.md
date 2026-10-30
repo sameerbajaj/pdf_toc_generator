@@ -276,3 +276,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 ## Acknowledgments
 
 Built with [PyMuPDF](https://pymupdf.readthedocs.io/) for PDF processing.
+
+---
+
+Part of the open-source tools collection by [Sameer Bajaj](https://sameerbajaj.com). Learn more on the [project page](https://sameerbajaj.com/tools/pdf-toc/).
